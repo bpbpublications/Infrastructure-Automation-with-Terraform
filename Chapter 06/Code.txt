@@ -1,0 +1,288 @@
+The ModuleDemo/Custommodules/customvpc/outputs.tf file is created with the following code:
+output "vpc_id" {
+	value = aws_vpc.devVPC.id
+}
+output "aws_internet_gateway" {
+	value = aws_internet_gateway.igw.id
+}
+output "public_subnet" {
+	value = aws_subnet.public_subnet.id
+}
+
+The ModuleDemo/Custommodules/customvpc/terraformVPC.tf file is created with the following code:
+#Providers are a logical abstraction of an upstream API. They help to understand API interactions and exposing provider resources such AWS, Google,
+provider "aws" {
+	region = var.apac_region
+}
+# Query all available Availability Zone; we will use specific availability zone using index - The Availability Zones data source provides access to the list of AWS Availability Zones which can be accessed by an AWS account specific to region configured in the provider.
+data "aws_availability_zones" "aws_az" {}
+
+# Provides a VPC resource - https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/vpc
+resource "aws_vpc" "devVPC" {
+	cidr_block = var.vpc_cidr_block
+	enable_dns_hostnames = true # default is false
+	tags = {
+		Name = "dev_terraform_vpc"
+	}
+}
+# Public Subnet - Provides an VPC subnet resource - https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/subnet.
+resource "aws_subnet" "public_subnet" {
+	cidr_block = var.public_cidr
+	vpc_id = aws_vpc.devVPC.id
+	map_public_ip_on_launch = true
+	availability_zone = data.aws_availability_zones.aws_az.names[1]
+	tags = {
+		Name = "dev_terraform_vpc_public_subnet"
+	}
+}
+
+
+# Private Subnet - Provides an VPC subnet resource - https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/subnet.
+resource "aws_subnet" "private_subnet" {
+	cidr_block = var.private_cidr
+	vpc_id = aws_vpc.devVPC.id
+	map_public_ip_on_launch = false
+	availability_zone = data.aws_availability_zones.aws_az.names[1]
+	tags = {
+		Name = "dev_terraform_vpc_private_subnet"
+	}
+}
+#To access EC2 instance inside a Virtual Private Cloud (VPC) we need an Internet Gateway and a routing table connecting the subnet to the Internet Gateway
+# Creating Internet Gateway
+# Provides a resource to create a VPC Internet Gateway - https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/internet_gateway.
+resource "aws_internet_gateway" "igw" {
+	vpc_id = aws_vpc.devVPC.id
+	tags = {
+		Name = "dev_terraform_vpc_igw"
+	}
+}
+
+# Provides a resource to create a VPC routing table - https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/route_table
+resource "aws_route_table" "public_route" {
+	vpc_id = aws_vpc.devVPC.id
+	route {
+		cidr_block = var.cidr_blocks
+		gateway_id = aws_internet_gateway.igw.id
+	}
+	tags = {
+		Name = "dev_terraform_vpc_public_route"
+	}
+}
+# Provides a resource to create an association between a Public Route Table and a Public Subnet - https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/route_table_association
+resource "aws_route_table_association" "public_subnet_association" {
+route_table_id = aws_route_table.public_route.id
+subnet_id = aws_subnet.public_subnet.id
+depends_on = [aws_route_table.public_route, aws_subnet.public_subnet]
+}
+The ModuleDemo/Custommodules/customvpc/vars.tf file is created with the following code:
+# Input Variables https://www.terraform.io/language/values/variables
+variable "apac_region" {
+default = "ap-south-1"
+}
+variable "cidr_blocks" {
+}
+#Network Mask - 255.255.255.0 Addresses Available - 256
+variable "vpc_cidr_block" {
+}
+variable "public_cidr" {
+}
+variable "private_cidr" {
+}
+
+The ModuleDemo/autoscaling.tf file is created with the following code (remember to input your OwnerID for the AMI ID filter):
+resource "aws_launch_configuration" "nginx_launch_config" {
+
+	image_id = data.aws_ami.packeramis.id
+	instance_type = var.instance_type
+	security_groups = [aws_security_group.sg_allow_ssh_http.id]
+	user_data = data.template_file.init.rendered
+	lifecycle {
+		create_before_destroy = true
+	}
+}
+resource "aws_autoscaling_group" "nginx_autoscaling_group" {
+	launch_configuration = aws_launch_configuration.nginx_launch_config.id
+	vpc_zone_identifier = [module.customvpc.public_subnet]
+	health_check_type = "ELB"
+	min_size = 2
+	max_size = 5
+	load_balancers = [aws_elb.nginx-elb.id]
+	tag {
+		key = "Name"
+		value = "dev_terraform_nginx_instance_asg"
+		propagate_at_launch = true
+	}
+}
+
+resource "aws_autoscaling_policy" "nginx_cpu_policy_scaleup" {
+	name = "nginx_cpu_policy_scaleup"
+	autoscaling_group_name = aws_autoscaling_group.nginx_autoscaling_group.name
+	adjustment_type = "ChangeInCapacity"
+	scaling_adjustment = 1
+	cooldown = "120"
+}
+
+resource "aws_autoscaling_policy" "nginx_cpu_policy_scaledown" {
+	name = "nginx_cpu_policy_scaledown"
+	autoscaling_group_name = aws_autoscaling_group.nginx_autoscaling_group.name
+	adjustment_type = "ChangeInCapacity"
+	scaling_adjustment = -1
+	cooldown = "120"
+}
+
+#Get latest AMI ID based on Filter - Here AMI created using Packer
+data "aws_ami" "packeramis" {
+	owners = ["1xxxxxxxxxxx"] #change the owner ID as per your account
+	most_recent = true
+	filter {
+		name = "name"
+		values = ["packer-nginx*"]
+	}
+}
+
+#The template_file data source usually loaded from an external file.
+data "template_file" "init" {
+	template = file("${path.module}/userdata.tpl")
+}
+
+The ModuleDemo/elb.tf file is created with the following code:
+# Elastic Load Balancer resource, also known as a Classic Load Balancer - https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/elb
+resource "aws_elb" "nginx-elb" {
+	name = "nginx-elb"
+	subnets = [module.customvpc.public_subnet]
+	security_groups = [aws_security_group.sg_allow_ssh_http.id]
+	listener {
+		instance_port = 80
+		instance_protocol = "http"
+		lb_port = 80
+		lb_protocol = "http"
+	}
+	health_check {
+		healthy_threshold = 3
+		unhealthy_threshold = 3
+		timeout = 3
+		target = "HTTP:80/"
+		interval = 30
+	}
+	tags = {
+		Name = "nginx_elb"
+	}
+}
+
+The ModuleDemo/devVPC.tf file is created with the following code:
+provider "aws" {
+	region = var.apac_region
+}
+
+module "customvpc" {
+	source = "./Custommodules/customvpc"
+	region = var.apac_region
+	cidr_blocks = "0.0.0.0/0"
+	vpc_cidr_block = "10.0.1.0/24"
+	public_cidr = "10.0.1.0/28"
+	private_cidr = "10.0.1.16/28"
+}
+
+In this code, note the source = "./Custommodules/customvpc". We are providing the path of the module here.
+
+The ModuleDemo/securitygroups.tf file is created with the following code:
+# Provides a security group resource - https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/security_group
+resource "aws_security_group" "sg_allow_ssh_http" {
+	vpc_id = module.customvpc.vpc_id
+
+	name = "dev_terraform_vpc_allow_ssh_http"
+	tags = {
+		Name = "dev_terraform_sg_allow_ssh_http"
+	}
+}
+
+# Ingress Security Port 22 (Inbound) - Provides a security group rule resource (https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/security_group_rule)
+	resource "aws_security_group_rule" "ssh_ingress_access" {
+	from_port = 22
+	protocol = "tcp"
+	security_group_id = aws_security_group.sg_allow_ssh_http.id
+	to_port = 22
+	type = "ingress"
+	cidr_blocks = [var.cidr_blocks]
+}
+
+# Ingress Security Port 80 (Inbound)
+resource "aws_security_group_rule" "http_ingress_access" {
+	from_port = 80
+	protocol = "tcp"
+	security_group_id = aws_security_group.sg_allow_ssh_http.id
+	to_port = 80
+	type = "ingress"
+	cidr_blocks = [var.cidr_blocks]
+}
+
+# Egress Security (Outbound)
+resource "aws_security_group_rule" "egress_access" {
+	from_port = 0
+	protocol = "-1"
+	security_group_id = aws_security_group.sg_allow_ssh_http.id
+	to_port = 0
+	type = "egress"
+	cidr_blocks = [var.cidr_blocks]
+}
+
+The ModuleDemo/userdata.tpl file is created with the following code:
+#!/bin/bash
+sudo service nginx start
+hostname >> /usr/share/nginx/html/index.html
+
+The ModuleDemo/vars.tf file is created with the following code:
+# Input Variables https://www.terraform.io/language/values/variables
+variable "apac_region" {
+	default = "ap-south-1"
+}
+variable "cidr_blocks" {
+	default = "0.0.0.0/0"
+}
+variable "instance_type" {
+	default = "t2.small"
+}
+
+The ModuleDemo/firstawsami-packer.json file is created with the following code:
+{
+"variables": {
+	"aws_access_key": "",
+	"aws_secret_key": ""
+},
+"builders": [
+	{
+	"type": "amazon-ebs",
+	"access_key": "{{user `aws_access_key`}}",
+	"secret_key": "{{user `aws_secret_key`}}",
+	"region": "ap-south-1",
+	"source_ami": "ami-0dafa01c8100180f8",
+	"instance_type": "t2.small",
+	"ssh_username": "ec2-user",
+	"ami_name": "packer-nginx-ami-{{timestamp}}"
+	}
+],
+"provisioners": [
+	{
+	"type": "shell",
+		"inline": [
+			"sudo yum update –y",
+			"sudo amazon-linux-extras install -y nginx1.12"
+		]
+	}
+]
+}
+Execute packer build -var "aws_access_key=XXXXXXXXXXXXXXXXXXXX" -var "aws_secret_key=XXXXXXXXXXXXXXXXXXXX" firstawsami-packer.json
+
+** Let’s push code into the GitHub repository and use it in a Terraform file using GitHub URL:
+We need to make changes in the devVPC.tf file - source = "github.com/terraform-home/custommoduledemo/Custommodules//customvpc":
+provider "aws" {
+	region = var.apac_region
+}
+module "customvpc" {
+	source = "github.com/terraform-home/custommoduledemo/Custommodules//customvpc"
+	region = var.apac_region
+	cidr_blocks = "0.0.0.0/0"
+	vpc_cidr_block = "10.0.1.0/24"
+	public_cidr = "10.0.1.0/28"
+	private_cidr = "10.0.1.16/28"
+}

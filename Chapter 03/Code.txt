@@ -1,0 +1,244 @@
+# vars.tf
+# Input Variables https://www.terraform.io/language/values/variables
+
+variable "aws_access_key" {
+}
+variable "aws_secret_key" {
+}
+
+variable "apac_region" {
+	default = "ap-south-1"
+}
+variable "cidr_blocks" {
+	default = "0.0.0.0/0"
+}
+#Network Mask - 255.255.255.0 Addresses Available - 256
+variable "vpc_cidr" {
+	default = "10.0.1.0/24"
+}
+
+variable "public_cidr" {
+	default = "10.0.1.0/28"
+}
+variable "private_cidr" {
+	default = "10.0.1.16/28"
+}
+variable "instance_type" {
+	default = "t2.micro"
+}
+
+** 
+provider "aws" {
+	region = "ap-south-1"
+}
+#Provides an EC2 instance resource.
+resource "aws_instance" "provisionerTestVM" {
+	ami = "ami-0c6615d1e95c98aca"
+	instance_type = "t2.micro"
+}
+
+Execute the terraform plan command to verify the execution plan.
+
+** add provisioner block in resource
+
+provider "aws" {
+	region = "ap-south-1"
+}
+#Provides an EC2 instance resource.
+resource "aws_instance" "provisionerTestVM" {
+	ami = "ami-0c6615d1e95c98aca"
+	instance_type = "t2.micro"
+
+	provisioner "local-exec" {
+		command = "echo Instance Type=${self.instance_type}, Instance ID=${self.id}, Public DNS=${self.public_dns}, AMI ID=${self.ami} >> allinstancedetails"
+	}
+
+}
+
+Execute the terraform apply command to create an instance in AWS.
+
+** Install packer using chocolatey by referring to https://community.chocolatey.org/packages/packer/1.2.2:
+
+choco install packer
+
+** The following is a script to create an AMI in Amazon EC2 using Packer
+
+{
+"variables": {
+	"aws_access_key": "",
+	"aws_secret_key": ""
+},
+"builders": [
+{
+	"type": "amazon-ebs",
+	"access_key": "{{user `aws_access_key`}}",
+	"secret_key": "{{user `aws_secret_key`}}",
+	"region": "ap-south-1",
+	"source_ami": "ami-0851b76e8b1bce90b",
+	"instance_type": "t2.micro",
+	"ssh_username": "ubuntu",
+	"ami_name": "packer-cf-ami-{{timestamp}}"
+
+}
+],
+"provisioners": [
+]
+}
+Save the file as firstawsami-packer.json.
+
+Execute following packer command to create AMI:
+
+packer build -var "aws_access_key=XXXXXXXXXXXXXXXXXXXX" -var "aws_secret_key=XXXXXXXXXXXXXXXXXXXX" firstawsami-packer.json
+
+
+** Let’s configure terraform script in a way that AMI created using Packer is considered based on the latest creation time.
+
+provider "aws" {
+	region = "ap-south-1"
+}
+
+#Get latest AMI ID based on Filter - Here AMI created using Packer
+data "aws_ami" "packeramis" {
+
+	owners = ["10xxxxxxxxxx"] #change the owner ID as per your account
+	most_recent = true
+	filter {
+		name = "name"
+		values = ["packer-cf*"]
+	}
+}
+#Provides an EC2 instance resource.
+resource "aws_instance" "provisionerTestVM" {
+	ami = data.aws_ami.packeramis.id
+	instance_type = "t2.micro"
+	provisioner "local-exec" {
+		command
+		= "echo Instance Type=${self.instance_type}, Instance ID=${self.id}, Public DNS=${self.public_dns}, AMI ID=${self.ami} >> allinstancedetails"
+	}
+}
+
+
+** Let’s consider a scenario where we would like to install Nginx using the remote-exec block.
+
+# Configure region in provider block using variable
+provider "aws" {
+	region = var.apac_region
+}
+
+# Query all avilable Availability Zone; we will use specific availability zone using index
+data "aws_availability_zones" "available" {}
+	
+	# VPC Creation using cidr block available in vars.tf
+	resource "aws_vpc" "provisionerVPC" {
+	cidr_block = var.vpc_cidr
+	
+	enable_dns_hostnames = true
+	enable_dns_support = true
+	
+	tags = {
+		Name = "dev-terraform-vpc"
+	}
+}
+
+# Public Subnet public cidr block available in vars.tf and provisionerVPC
+resource "aws_subnet" "public_subnet" {
+	cidr_block = var.public_cidr
+	vpc_id = aws_vpc.provisionerVPC.id
+	
+	map_public_ip_on_launch = true
+	availability_zone = data.aws_availability_zones.available.names[1]
+	
+	tags = {
+		Name = "dev-public-subnet"
+	}
+}
+
+#To access EC2 instance inside a Virtual Private Cloud (VPC) we need an Internet Gateway and a routing table connecting the subnet to the Internet Gateway
+# Creating Internet Gateway
+resource "aws_internet_gateway" "gw" {
+	vpc_id = aws_vpc.provisionerVPC.id
+	tags = {
+		Name = "dev-gw"
+	}
+}
+
+# Public Route Table
+resource "aws_route_table" "public_route" {
+	vpc_id = aws_vpc.provisionerVPC.id
+	route {
+		cidr_block = var.cidr_blocks
+		gateway_id = aws_internet_gateway.gw.id
+	}
+	tags = {
+		Name = "dev-public-route"
+	}
+}
+
+# Associate Public Subnet with Public Route Table
+resource "aws_route_table_association" "public_subnet_assoc" {
+	route_table_id = aws_route_table.public_route.id
+	subnet_id = aws_subnet.public_subnet.id
+	depends_on = [aws_route_table.public_route, aws_subnet.public_subnet]
+}
+
+# Security Group Creation for provisionerVPC
+resource "aws_security_group" "dev_terraform_sg_allow_ssh_http" {
+	name = "dev-sg"
+	vpc_id = aws_vpc.provisionerVPC.id
+}
+
+# Ingress Security Port 22 (Inbound)
+resource "aws_security_group_rule" "ssh_ingress_access" {
+	from_port = 22
+	protocol = "tcp"
+	security_group_id = aws_security_group.dev_terraform_sg_allow_ssh_http .id
+	to_port = 22
+	type = "ingress"
+	cidr_blocks = [var.cidr_blocks]
+}
+
+# Ingress Security Port 80 (Inbound)
+resource "aws_security_group_rule" "http_ingress_access" {
+	from_port = 80
+	protocol = "tcp"
+	security_group_id = aws_security_group.dev_terraform_sg_allow_ssh_http .id
+	to_port = 80
+	type = "ingress"
+	cidr_blocks = [var.cidr_blocks]
+}
+
+# All egress/outbound Access
+resource "aws_security_group_rule" "all_egress_access" {
+	from_port = 0
+	protocol = "-1"
+	security_group_id = aws_security_group.dev_terraform_sg_allow_ssh_http .id
+	to_port = 0
+	type = "egress"
+	cidr_blocks = [var.cidr_blocks]
+}
+
+# Instance Configuration
+resource "aws_instance" "provisioner-remoteVM" {
+	ami = "ami-0c6615d1e95c98aca"
+	instance_type = var.instance_type
+	key_name = "terraform"
+	vpc_security_group_ids = [aws_security_group.dev_terraform_sg_allow_ssh_http.id]
+	subnet_id = aws_subnet.public_subnet.id
+	tags = {
+		Name = "remote-instance"
+	}
+	provisioner "remote-exec" {
+		inline = [
+			"sudo yum update -y",
+			"sudo amazon-linux-extras install -y nginx1",
+			"sudo service nginx start"
+		]
+	}
+	connection {
+		type = "ssh"
+		host = aws_instance.provisioner-remoteVM.public_ip
+		user = "ec2-user"
+		password = ""
+		private_key = file("${path.module}/terraform.pem")
+	}
+}
