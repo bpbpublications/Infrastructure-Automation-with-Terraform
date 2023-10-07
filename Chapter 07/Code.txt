@@ -1,0 +1,172 @@
+#### Chapter 7 Terraform Cloud
+### Creating Terraform configuration in VC Repository
+## 1.	Create a file for variable declaration with the name ‘variable.tf’
+# variable.tf
+variable "client_secret" {
+    description = "Enter your CLient Secret. Please make sure you do not store the value of your client secret in the SCM repository. This can be added to Terraform Cloud Variables."
+}
+variable "client_id" {
+    description = "Enter your client Id.Please make sure you do not store the value of your client Id in the SCM repository. This can be added to Terraform Cloud Variables."
+}
+variable "subscription_id" {
+    description = "Enter your subscription id. Please make sure you do not store the value of your subscription id in the SCM repository. This can be added to Terraform Cloud Variables."
+}
+variable "tenant_id" {
+    description = "Enter your tenant id. Please make sure you do not store the value of your Tenant id in the SCM repository. This can be added to Terraform Cloud Variables."
+}
+variable "prefix" {
+  description = "The prefix which should be used for all resources in this Chapter"
+  default = "test"
+}
+variable "location" {
+  description = "The Azure Region in which all resources in this Chapter should be created."
+  default = "West Europe"
+}
+
+## 2.	Create a ‘main.tf’ file 
+# main.tf
+# Configure the Microsoft Azure Provider
+provider "azurerm" {
+  features {}
+  subscription_id = var.subscription_id
+  client_id       = var.client_id
+  client_secret   = var.client_secret
+  tenant_id       = var.tenant_id
+}
+# Azure Provider source and version being used
+terraform {
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "=2.46.0"
+    }
+  }
+}
+# Create a resource group
+resource "azurerm_resource_group" "test-rg" {
+  name     = "${var.prefix}-resources"
+  location = "${var.location}"
+}
+
+## 3.
+# virtual_network.tf
+# Virtual network
+resource "azurerm_virtual_network" "vnet" {
+  name = "${var.prefix}-vnet"
+  address_space = ["10.0.0.0/16"]
+  location = var.location
+  resource_group_name = azurerm_resource_group.test-rg.name
+}
+# Subnet
+resource "azurerm_subnet" "subnet" {
+  name = "${var.prefix}Subnet"
+  resource_group_name =  azurerm_resource_group.test-rg.name
+  virtual_network_name = azurerm_virtual_network.vnet.name
+  address_prefixes = ["10.0.1.0/24"]
+}
+# Public ip
+resource "azurerm_public_ip" "publicip" {
+  name = "pip1"
+  location = var.location
+  resource_group_name = azurerm_resource_group.test-rg.name
+  allocation_method = "Dynamic"
+  sku = "Basic"
+}
+# Network interface
+resource "azurerm_network_interface" "nic" {
+  name = "${var.prefix}-nic"
+  location = var.location
+  resource_group_name = azurerm_resource_group.test-rg.name
+
+  ip_configuration {
+    name = "ipconfig1"
+    subnet_id = azurerm_subnet.subnet.id
+    private_ip_address_allocation = "Dynamic"
+    public_ip_address_id = azurerm_public_ip.publicip.id
+  }
+}
+# Security Group
+resource "azurerm_network_security_group" "frontendnsg" {
+  name                = "${var.prefix}SecurityGroup"
+  location            = var.location
+  resource_group_name = azurerm_resource_group.test-rg.name
+
+  tags = {
+    environment = "Production"
+  }
+}
+# Security rules
+resource "azurerm_network_security_rule" "sshrule" {
+  name                       = "${var.prefix}ssh"
+  priority                   = 101
+  direction                  = "Inbound"
+  access                     = "Allow"
+  protocol                   = "Tcp"
+  source_port_range          = "*"
+  destination_port_range     = "22"
+  source_address_prefix      = "*"
+  destination_address_prefix = "10.0.1.0/24"
+  resource_group_name         = azurerm_resource_group.test-rg.name
+  network_security_group_name = azurerm_network_security_group.frontendnsg.name
+}
+resource "azurerm_network_security_rule" "httprule" {
+  name                       = "${var.prefix}http"
+  priority                   = 100
+  direction                  = "Inbound"
+  access                     = "Allow"
+  protocol                   = "Tcp"
+  source_port_range          = "*"
+  destination_port_range     = "8080"
+  source_address_prefix      = "*"
+  destination_address_prefix = "10.0.1.0/24"
+  resource_group_name         = azurerm_resource_group.test-rg.name
+  network_security_group_name = azurerm_network_security_group.frontendnsg.name
+}
+
+resource "azurerm_subnet_network_security_group_association" "subnetsecuritygroup" {
+  subnet_id                 = azurerm_subnet.subnet.id
+  network_security_group_id = azurerm_network_security_group.frontendnsg.id
+}
+
+## 4.
+# virtual_machine.tf
+resource "azurerm_virtual_machine" "vm" {
+
+  name                  = "${var.prefix}-tc-vm"
+  location              = var.location
+  resource_group_name   = azurerm_resource_group.test-rg.name
+  network_interface_ids = [azurerm_network_interface.nic.id]
+  vm_size               = "Standard_DS1_v2"
+
+  # Uncomment this line to delete the OS disk automatically when deleting the VM
+  # delete_os_disk_on_termination = true
+  # Uncomment this line to delete the data disks automatically when deleting the VM
+  # delete_data_disks_on_termination = true
+  storage_image_reference {
+    publisher = "Canonical"
+    offer     = "UbuntuServer"
+    sku       = "16.04-LTS"
+    version   = "latest"
+  }
+  storage_os_disk {
+    name              = "${var.prefix}osdisk1"
+    caching           = "ReadWrite"
+    create_option     = "FromImage"
+    managed_disk_type = "Standard_LRS"
+  }
+  os_profile {
+    computer_name  = "hostname"
+    admin_username = "${var.prefix}admin"
+    admin_password = "Password1234!"
+  }
+  os_profile_linux_config {
+    disable_password_authentication = false
+  }
+  tags = {
+    environment = "Production"
+   }
+  }
+  
+  }
+}
+
